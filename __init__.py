@@ -262,17 +262,28 @@ class DiscordActivity:
         deck = mw.col.decks.current()
         return deck.get("name", "Unknown Deck")
 
-    def _get_queue_counts(self) -> tuple[int, int, int]:
-        new_count, learning_count, review_count = mw.col.sched.counts()
-        return int(new_count), int(learning_count), int(review_count)
+    def _get_progress(self) -> tuple[int, int]:
+        """Return (learnt, total) for the current deck.
+
+        'Learnt' = all cards that have graduated (type 2 = review).
+        'Total'  = total number of cards in the current deck.
+        """
+        did = mw.col.decks.current()["id"]
+        total = mw.col.db.scalar(
+            "SELECT count() FROM cards WHERE did = ?", did
+        )
+        learnt = mw.col.db.scalar(
+            "SELECT count() FROM cards WHERE did = ? AND type = 2", did
+        )
+        return learnt or 0, total or 0
 
     def _build_payload(self) -> dict:
         deck_name = self._get_current_deck_name()
-        new_count, learning_count, review_count = self._get_queue_counts()
+        learnt, total = self._get_progress()
 
         return {
-            "details": f"Studying with Anki, on Deck: {deck_name}",
-            "state": f"New {new_count} | Learn {learning_count} | Review {review_count}",
+            "details": f"Studying: {deck_name}",
+            "state": f"Memorized {learnt} of {total}",
             "timestamps": {"start": self.started_at},
             "assets": {
                 "large_image": self.large_image,
