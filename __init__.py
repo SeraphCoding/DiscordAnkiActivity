@@ -28,7 +28,7 @@ class PresenceConfig:
 
 
 DEFAULT_CONFIG = {
-    "discord_client_id": "1376678622427162717",
+    "discord_client_id": "1478451530653765753",
     "update_interval_seconds": 15,
     "large_image": "anki",
     "large_text": "Studying with Anki",
@@ -41,68 +41,138 @@ class DiscordIPC:
     def __init__(self, client_id: str) -> None:
         self.client_id = client_id
         self.sock: Optional[socket.socket] = None
+        self._pipe = None  # Windows named pipe handle
 
     def _candidate_paths(self) -> list[str]:
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-        base_dirs = [p for p in [runtime_dir, "/tmp", "/var/tmp", "/run/user/%s" % os.getuid()] if p]
+        run_user_dir = f"/run/user/{os.getuid()}" if hasattr(os, "getuid") else None
+        base_dirs = [p for p in [runtime_dir, "/tmp", "/var/tmp", run_user_dir] if p]
         candidates: list[str] = []
         for base_dir in base_dirs:
             for index in range(10):
                 candidates.append(str(Path(base_dir) / f"discord-ipc-{index}"))
         return candidates
 
+    def _candidate_pipe_names(self) -> list[str]:
+        """Named pipe paths for Windows."""
+        return [f"\\\\?\\pipe\\discord-ipc-{i}" for i in range(10)]
+
     def _send_packet(self, opcode: int, payload: dict[str, Any]) -> None:
-        if self.sock is None:
+        if self.sock is None and self._pipe is None:
             raise RuntimeError("Discord IPC socket is not connected")
 
         body = json.dumps(payload).encode("utf-8")
         header = struct.pack("<ii", opcode, len(body))
-        self.sock.sendall(header + body)
+        data = header + body
+
+        if self.sock is not None:
+            self.sock.sendall(data)
+        else:
+            self._pipe_write(data)
 
     def _recv_packet(self) -> tuple[int, dict[str, Any]]:
-        if self.sock is None:
+        if self.sock is None and self._pipe is None:
             raise RuntimeError("Discord IPC socket is not connected")
 
-        header = self.sock.recv(8)
+        header = self._read_bytes(8)
         if len(header) != 8:
             raise RuntimeError("Invalid Discord IPC response header")
 
         opcode, length = struct.unpack("<ii", header)
-        body = b""
-        while len(body) < length:
-            chunk = self.sock.recv(length - len(body))
-            if not chunk:
-                raise RuntimeError("Discord IPC socket closed unexpectedly")
-            body += chunk
+        body = self._read_bytes(length)
 
         payload = json.loads(body.decode("utf-8"))
         return opcode, payload
 
+    def _read_bytes(self, n: int) -> bytes:
+        if self.sock is not None:
+            data = b""
+            while len(data) < n:
+                chunk = self.sock.recv(n - len(data))
+                if not chunk:
+                    raise RuntimeError("Discord IPC socket closed unexpectedly")
+                data += chunk
+            return data
+        else:
+            return self._pipe_read(n)
+
+    def _pipe_write(self, data: bytes) -> None:
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.windll.kernel32
+        written = ctypes.wintypes.DWORD()
+        kernel32.WriteFile(self._pipe, data, len(data), ctypes.byref(written), None)
+
+    def _pipe_read(self, n: int) -> bytes:
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.windll.kernel32
+        buf = ctypes.create_string_buffer(n)
+        read = ctypes.wintypes.DWORD()
+        kernel32.ReadFile(self._pipe, buf, n, ctypes.byref(read), None)
+        return buf.raw[: read.value]
+
     def connect(self) -> None:
         last_error: Optional[Exception] = None
+        self._pipe = None
 
-        for path in self._candidate_paths():
-            try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.connect(path)
-                self.sock = sock
-                self._send_packet(
-                    OPCODE_HANDSHAKE,
-                    {
-                        "v": 1,
-                        "client_id": self.client_id,
-                    },
-                )
-                self._recv_packet()
-                return
-            except Exception as exc:
-                last_error = exc
-                if self.sock:
-                    try:
-                        self.sock.close()
-                    except Exception:
-                        pass
-                    self.sock = None
+        if os.name == "nt":
+            # Windows: use named pipes
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            GENERIC_READ_WRITE = 0xC0000000
+            OPEN_EXISTING = 3
+            INVALID_HANDLE = -1
+
+            for pipe_name in self._candidate_pipe_names():
+                try:
+                    handle = kernel32.CreateFileW(
+                        pipe_name,
+                        GENERIC_READ_WRITE,
+                        0,
+                        None,
+                        OPEN_EXISTING,
+                        0,
+                        None,
+                    )
+                    if handle == INVALID_HANDLE:
+                        raise OSError(f"Cannot open pipe {pipe_name}")
+                    self._pipe = handle
+                    self._send_packet(
+                        OPCODE_HANDSHAKE,
+                        {"v": 1, "client_id": self.client_id},
+                    )
+                    self._recv_packet()
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if self._pipe and self._pipe != INVALID_HANDLE:
+                        try:
+                            kernel32.CloseHandle(self._pipe)
+                        except Exception:
+                            pass
+                        self._pipe = None
+        else:
+            # Unix: use AF_UNIX sockets
+            for path in self._candidate_paths():
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.connect(path)
+                    self.sock = sock
+                    self._send_packet(
+                        OPCODE_HANDSHAKE,
+                        {"v": 1, "client_id": self.client_id},
+                    )
+                    self._recv_packet()
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if self.sock:
+                        try:
+                            self.sock.close()
+                        except Exception:
+                            pass
+                        self.sock = None
 
         raise RuntimeError(f"Unable to connect to Discord IPC socket ({last_error})")
 
@@ -125,13 +195,19 @@ class DiscordIPC:
         self._recv_packet()
 
     def close(self) -> None:
-        if not self.sock:
-            return
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        if self._pipe:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(self._pipe)
+            except Exception:
+                pass
+            self._pipe = None
 
 
 class DiscordActivity:
@@ -195,11 +271,13 @@ class DiscordActivity:
         new_count, learning_count, review_count = self._get_queue_counts()
 
         return {
-            "details": f"Deck: {deck_name}",
+            "details": f"Studying with Anki, on Deck: {deck_name}",
             "state": f"New {new_count} | Learn {learning_count} | Review {review_count}",
-            "large_image": self.large_image,
-            "large_text": self.large_text,
             "timestamps": {"start": self.started_at},
+            "assets": {
+                "large_image": self.large_image,
+                "large_text": self.large_text,
+            },
         }
 
     def update_presence(self, *_args) -> None:
